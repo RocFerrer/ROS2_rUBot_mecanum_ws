@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import math
 import rclpy
 from rclpy.node import Node
@@ -9,87 +7,113 @@ from geometry_msgs.msg import Twist
 
 
 class WallFollower(Node):
-
     def __init__(self):
         super().__init__('wall_follower_node')
 
-        # -------------------- Parameters --------------------
-        self.declare_parameter('distance_limit', 0.5)    # desired right-wall distance
-        self.declare_parameter('forward_speed', 0.10)    # max linear speed
-        self.declare_parameter('min_speed', 0.03)        # minimum linear speed
-        self.declare_parameter('kp_wall', 1.5)           # P gain for wall following
-        self.declare_parameter('max_ang', 0.6)           # angular speed limit
-        self.declare_parameter('time_to_stop', 30.0)     # auto-stop time
+        # Parameters
+        self.declare_parameter('distance_limit', 0.2)    # desired distance to right wall
+        self.declare_parameter('forward_speed', 0.1)    # linear speed
+        self.declare_parameter('turn_speed', 0.1)       # angular speed
+        self.declare_parameter('time_to_stop', 30.0)     # auto-stop
+        self.declare_parameter('tolerance', 0.05)        # band around base_distance (RIGHT)
 
         self.base_distance = float(self.get_parameter('distance_limit').value)
         self.v_lin = float(self.get_parameter('forward_speed').value)
-        self.min_speed = float(self.get_parameter('min_speed').value)
-        self.kp = float(self.get_parameter('kp_wall').value)
-        self.max_ang = float(self.get_parameter('max_ang').value)
+        self.v_ang = float(self.get_parameter('turn_speed').value)
         self.time_to_stop = float(self.get_parameter('time_to_stop').value)
+        self.tol = float(self.get_parameter('tolerance').value)
 
-        # Last command
+        # Last commanded twist (will be published periodically)
         self.cmd = Twist()
 
-        # ROS interfaces
+        # ROS 2 entities
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.laser_callback, qos_profile_sensor_data
         )
         self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # Timers
-        self.cmd_timer = self.create_timer(0.1, self.publish_cmd)   # 10 Hz
         self.info_timer = self.create_timer(1.0, self.log_info)
         self.stop_timer = self.create_timer(0.05, self.stop_watchdog)
 
-        self.start_time = self.get_clock().now().nanoseconds * 1e-9
-        self.state = "Idle"
-        self.last_logged_state = None
-        self.shutting_down = False
+        # Periodic cmd_vel publisher at 10 Hz (0.1 s)
+        self.cmd_timer = self.create_timer(0.1, self.cmd_publish_timer_cb)
 
-        self.get_logger().info("Wall follower with P-control started")
+        self._state_action = "Idle"
+        self._last_action_logged = None
+        self._shutting_down = False
 
-    # ------------------------------------------------------
+        self.start_time_s = self.get_clock().now().nanoseconds * 1e-9
+
+        self.get_logger().info(
+            "WallFollower (RIGHT tol, BACK_RIGHT when closest) - differential drive."
+        )
+
+    #--------------------------------------------------------------------
     def stop_watchdog(self):
-        if self.shutting_down:
+        """Stop the robot after time_to_stop seconds."""
+        if self._shutting_down:
             return
-
         now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.start_time >= self.time_to_stop:
-            self.get_logger().info("Time limit reached — stopping")
+        if now - self.start_time_s >= self.time_to_stop:
+            self.get_logger().info("Stopping due to timeout.")
             self.stop()
 
-    # ------------------------------------------------------
+    #--------------------------------------------------------------------
     def stop(self):
-        self.shutting_down = True
+        """Safe stop: set cmd to zero Twist, try to publish once, stop timers."""
+        self._shutting_down = True
+
+        # Set last command to zero
         self.cmd = Twist()
 
+        # Try a final publish (publisher may still be valid even if shutdown started)
         try:
             self.publisher.publish(self.cmd)
         except Exception:
+            # Context/publisher may already be invalid -> ignore
             pass
 
-        for t in [self.cmd_timer, self.info_timer, self.stop_timer]:
+        # Cancel timers safely
+        for t in [self.info_timer, self.stop_timer, self.cmd_timer]:
             try:
                 t.cancel()
             except Exception:
                 pass
 
-    # ------------------------------------------------------
-    def publish_cmd(self):
-        if not self.shutting_down:
-            self.publisher.publish(self.cmd)
+    #--------------------------------------------------------------------
+    def cmd_publish_timer_cb(self):
+        """Periodic publisher: send the latest cmd_vel at 10 Hz."""
+        if self._shutting_down:
+            return
 
-    # ------------------------------------------------------
+        try:
+            self.publisher.publish(self.cmd)
+        except Exception:
+            # If the context or publisher is invalid, ignore
+            pass
+
+    #--------------------------------------------------------------------
     def laser_callback(self, scan):
-        if self.shutting_down:
+        if self._shutting_down:
             return
 
         angle_min = math.degrees(scan.angle_min)
         angle_inc = math.degrees(scan.angle_increment)
 
-        FRONT, FR_RIGHT, RIGHT = [], [], []
+        # Sector arrays
+        sectors = {
+            "FRONT": [],
+            "FR_RIGHT": [],
+            "RIGHT": [],
+            "BACK_RIGHT": [],
+            "FRONT_LEFT": [],
+            "LEFT": [],
+            "BACK_LEFT": [],
+            "BACK": []
+        }
 
+        # Sort lidar measurements into sectors
         for i, d in enumerate(scan.ranges):
             if not math.isfinite(d):
                 continue
@@ -99,79 +123,118 @@ class WallFollower(Node):
             ang = angle_min + i * angle_inc
 
             if -20 <= ang <= 20:
-                FRONT.append(d)
+                sectors["FRONT"].append(d)
             elif -70 <= ang < -20:
-                FR_RIGHT.append(d)
+                sectors["FR_RIGHT"].append(d)
             elif -110 <= ang < -70:
-                RIGHT.append(d)
+                sectors["RIGHT"].append(d)
+            elif -160 <= ang < -110:
+                sectors["BACK_RIGHT"].append(d)
+            elif 20 < ang <= 70:
+                sectors["FRONT_LEFT"].append(d)
+            elif 70 < ang <= 110:
+                sectors["LEFT"].append(d)
+            elif 110 < ang <= 160:
+                sectors["BACK_LEFT"].append(d)
+            elif ang >= 160 or ang <= -160:
+                sectors["BACK"].append(d)
 
-        min_front = min(FRONT) if FRONT else float('inf')
-        min_fr = min(FR_RIGHT) if FR_RIGHT else float('inf')
-        min_right = min(RIGHT) if RIGHT else float('inf')
+        # Compute minimum per sector
+        min_dist = {}
+        for name, values in sectors.items():
+            min_dist[name] = min(values) if values else float('inf')
+
+        # Find absolute minimum and sector where it occurs
+        closest_sector = min(min_dist, key=min_dist.get)
+        closest_value = min_dist[closest_sector]
 
         twist = Twist()
         action = ""
 
-        # ------------------ SAFETY RULES ------------------
-        if min_front < self.base_distance:
-            twist.linear.x = 0.0
-            twist.angular.z = +self.max_ang
-            action = f"FRONT obstacle {min_front:.2f} m → turn LEFT"
+        # If nothing is close → stop
+        if closest_value == float('inf'):
+            self.cmd = Twist()
+            self._state_action = "CLEAR → STOP"
+            return
 
-        elif min_fr < self.base_distance:
-            twist.linear.x = self.min_speed
-            twist.angular.z = +self.max_ang
-            action = f"FRONT-RIGHT obstacle {min_fr:.2f} m → turn LEFT"
-
-        # ---------------- WALL FOLLOW (P CONTROL) ----------------
-        elif math.isfinite(min_right):
-            error = min_right - self.base_distance
-
-            # Proportional controller
-            ang_z = -self.kp * error
-            ang_z = max(-self.max_ang, min(self.max_ang, ang_z))
-
-            # Slow down when turning
-            speed_factor = max(0.0, 1.0 - abs(ang_z) / self.max_ang)
-            lin_x = self.min_speed + (self.v_lin - self.min_speed) * speed_factor
-
-            twist.linear.x = lin_x
-            twist.angular.z = ang_z
-
-            action = (
-                f"Wall follow | d={min_right:.2f} m | "
-                f"err={error:.2f} | v={lin_x:.2f} | w={ang_z:.2f}"
-            )
-
+        # ----------- REACT ONLY WHEN BELOW LIMIT -------------
+        if closest_value >= self.base_distance:
+            # Nothing too close → go forward
+            twist.linear.x = self.v_lin
+            twist.linear.y = 0.0
+            twist.angular.z = 0.0
+            action = f"SAFE ({closest_value:.2f}) → FORWARD"
         else:
-            action = "No wall detected → STOP"
+            # ----------- MIN DISTANCE REACHED → MOVE HOLONOMICALLY ----------
+            if closest_sector == "FRONT":
+                twist.linear.x = 0.0
+                twist.linear.y = +self.v_lin
+                action = f"FRONT {closest_value:.2f} → MOVE LEFT"
 
+            elif closest_sector == "FR_RIGHT":
+                twist.linear.x = +self.v_lin
+                twist.linear.y = +self.v_lin
+                action = f"FRONT-RIGHT {closest_value:.2f} → MOVE FRONT-LEFT"
+
+            elif closest_sector == "RIGHT":
+                twist.linear.x = +self.v_lin
+                twist.linear.y = 0.0
+                action = f"RIGHT {closest_value:.2f} → MOVE FORWARD"
+
+            elif closest_sector == "BACK_RIGHT":
+                twist.linear.x = +self.v_lin
+                twist.linear.y = -self.v_lin
+                action = f"BACK-RIGHT {closest_value:.2f} → MOVE FRONT-RIGHT"
+
+            elif closest_sector == "FRONT_LEFT":
+                twist.linear.x = -self.v_lin
+                twist.linear.y = +self.v_lin
+                action = f"FRONT-LEFT {closest_value:.2f} → MOVE BACK-LEFT"
+
+            elif closest_sector == "LEFT":
+                twist.linear.x = -self.v_lin
+                twist.linear.y = 0.0
+                action = f"LEFT {closest_value:.2f} → MOVE BACKWARDS"
+
+            elif closest_sector == "BACK_LEFT":
+                twist.linear.x = -self.v_lin
+                twist.linear.y = -self.v_lin
+                action = f"BACK-LEFT {closest_value:.2f} → MOVE BACK-RIGHT"
+
+            elif closest_sector == "BACK":
+                twist.linear.x = 0.0
+                twist.linear.y = -self.v_lin
+                action = f"BACK {closest_value:.2f} → MOVE RIGHT"
+
+        # Store and publish
         self.cmd = twist
 
-        if action != self.last_logged_state:
+        if action != self._last_action_logged:
             self.get_logger().info(action)
-            self.last_logged_state = action
+            self._last_action_logged = action
 
-        self.state = action
+        self._state_action = action
 
-    # ------------------------------------------------------
+    #--------------------------------------------------------------------
     def log_info(self):
-        if not self.shutting_down:
-            self.get_logger().info(self.state)
-
+        if not self._shutting_down:
+            self.get_logger().info(self._state_action)
 
 def main(args=None):
     rclpy.init(args=args)
     node = WallFollower()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.stop()
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
 
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
